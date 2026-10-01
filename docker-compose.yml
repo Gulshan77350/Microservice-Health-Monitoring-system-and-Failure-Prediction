@@ -1,53 +1,60 @@
-version: '3.9'
+# One image for all three simulated services (built once from services/Dockerfile),
+# run as three containers that differ only by SERVICE_NAME / DOWNSTREAM_URL.
+x-service: &service
+  image: health-monitor/service:local
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/livez')"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 5s
 
 services:
 
-  # ── Microservice 1: Payment ──────────────────────────────────────────────
+  # ── Simulated microservices: payment -> order -> notification ────────────
   payment-service:
-    build: ./services/payment
+    <<: *service
+    build:
+      context: .
+      dockerfile: services/Dockerfile
     container_name: payment-service
+    environment:
+      - SERVICE_NAME=payment
+      - DOWNSTREAM_URL=http://order-service:8000
+      - API_KEY=${API_KEY:-local-demo-key}
     ports:
       - "8001:8000"
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c",
-             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 5s
 
-  # ── Microservice 2: Order ────────────────────────────────────────────────
   order-service:
-    build: ./services/order
+    <<: *service
+    pull_policy: never
     container_name: order-service
+    environment:
+      - SERVICE_NAME=order
+      - DOWNSTREAM_URL=http://notification-service:8000
+      - API_KEY=${API_KEY:-local-demo-key}
     ports:
       - "8002:8000"
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c",
-             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 5s
+    depends_on:
+      payment-service:
+        condition: service_started
 
-  # ── Microservice 3: Notification ─────────────────────────────────────────
   notification-service:
-    build: ./services/notification
+    <<: *service
+    pull_policy: never
     container_name: notification-service
+    environment:
+      - SERVICE_NAME=notification
+      - DOWNSTREAM_URL=
+      - API_KEY=${API_KEY:-local-demo-key}
     ports:
       - "8003:8000"
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c",
-             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 5s
+    depends_on:
+      payment-service:
+        condition: service_started
 
-  # ── Prediction API (ML model) ─────────────────────────────────────────────
+  # ── Prediction API (calibrated XGBoost, artifacts/v3) ────────────────────
   prediction-api:
     build:
       context: .
@@ -68,16 +75,8 @@ services:
     volumes:
       - api-data:/data
     restart: unless-stopped
-    depends_on:
-      payment-service:
-        condition: service_healthy
-      order-service:
-        condition: service_healthy
-      notification-service:
-        condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c",
-             "import urllib.request; urllib.request.urlopen('http://localhost:8004/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8004/health')"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -102,8 +101,7 @@ services:
       notification-service:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c",
-             "import urllib.request; urllib.request.urlopen('http://localhost:8005/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8005/health')"]
       interval: 10s
       timeout: 5s
       retries: 3
