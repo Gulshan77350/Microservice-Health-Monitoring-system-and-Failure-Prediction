@@ -497,7 +497,7 @@ def main():
         "created_at_utc": datetime.now(UTC).isoformat(timespec="seconds"),
         "git": git_info(),
         "dataset": {
-            "path": str(args.data.relative_to(ROOT)) if args.data.is_relative_to(ROOT) else str(args.data),
+            "path": args.data.relative_to(ROOT).as_posix() if args.data.is_relative_to(ROOT) else str(args.data),
             "md5": file_md5(args.data),
             "rows": int(len(raw)),
             "per_step_failure_rate": round(float(raw["failure"].mean()), 4),
