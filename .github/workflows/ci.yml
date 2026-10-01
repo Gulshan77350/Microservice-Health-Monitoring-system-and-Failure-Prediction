@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python lint + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            model/requirements.txt
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pytest
+      - name: Dataset is reproducible and matches the committed artifact
+        run: |
+          python -m model.generate_data --check
+          python - <<'EOF'
+          import hashlib, json, pathlib
+          meta = json.loads(pathlib.Path("artifacts/v3/metadata.json").read_text())
+          got = hashlib.md5(pathlib.Path("model/data/synthetic_telemetry.csv").read_bytes()).hexdigest()
+          assert got == meta["dataset"]["md5"], (got, meta["dataset"]["md5"])
+          print("dataset md5 matches artifacts/v3:", got)
+          EOF
+
+  dashboard:
+    name: Dashboard lint + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+
+  docker:
+    name: Docker compose build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose config --quiet
+      - run: docker compose build

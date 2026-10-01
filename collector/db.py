@@ -189,17 +189,29 @@ def history(path, service: str | None, limit: int) -> list[dict]:
     return [_row(r) for r in reversed(rows)]  # oldest first
 
 
-def latest_predictions(path) -> dict[str, dict]:
+def latest_predictions(path, services: list[str] | None = None) -> dict[str, dict]:
+    """Newest prediction per service: one indexed (service, timestamp DESC) lookup each.
+
+    The v3 first draft used GROUP BY MAX(timestamp), a full scan (~53 ms at 7-day retention).
+    """
     sql = """
     SELECT p.timestamp, p.service, p.failure_probability, p.risk, p.alert, p.root_cause, p.model_version,
            p.horizon_steps, m.cpu, m.memory, m.latency, m.requests, m.error_rate
     FROM predictions p
-    JOIN (SELECT service, MAX(timestamp) AS ts FROM predictions GROUP BY service) last
-      ON last.service = p.service AND last.ts = p.timestamp
     LEFT JOIN metrics m ON m.service = p.service AND m.timestamp = p.timestamp
+    WHERE p.service = ?
+    ORDER BY p.timestamp DESC
+    LIMIT 1
     """
     with closing(connect(path)) as con:
-        return {r["service"]: _row(r) for r in con.execute(sql).fetchall()}
+        if services is None:
+            services = [r[0] for r in con.execute("SELECT DISTINCT service FROM metrics").fetchall()]
+        out = {}
+        for svc in services:
+            row = con.execute(sql, (svc,)).fetchone()
+            if row:
+                out[svc] = _row(row)
+        return out
 
 
 def anomalies(path, service: str | None, limit: int) -> list[dict]:

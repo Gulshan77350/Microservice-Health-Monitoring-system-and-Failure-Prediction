@@ -1,0 +1,50 @@
+{
+  "machine": {
+    "platform": "Windows-10-10.0.26200-SP0",
+    "processor": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+    "cpu_count": 20,
+    "python": "3.11.16"
+  },
+  "run_at_utc": "2026-10-01T22:10:28+00:00",
+  "inference_single_row": {
+    "n": 2000,
+    "p50_ms": 6.839,
+    "p95_ms": 9.222,
+    "p99_ms": 9.586,
+    "mean_ms": 7.212
+  },
+  "predict_batch_endpoint_3_services": {
+    "n": 500,
+    "p50_ms": 30.693,
+    "p95_ms": 31.523,
+    "p99_ms": 32.013,
+    "mean_ms": 30.681
+  },
+  "collector_sqlite": {
+    "metric_rows": 362880,
+    "prediction_rows": 362880,
+    "bulk_load_seconds": 4.59,
+    "db_size_mb": 120.3,
+    "history_service_limit_100": {
+      "n": 300,
+      "p50_ms": 1.858,
+      "p95_ms": 2.083,
+      "p99_ms": 2.221,
+      "mean_ms": 1.888
+    },
+    "history_all_limit_2000": {
+      "n": 100,
+      "p50_ms": 12.33,
+      "p95_ms": 13.23,
+      "p99_ms": 58.843,
+      "mean_ms": 12.9
+    },
+    "latest_predictions": {
+      "n": 300,
+      "p50_ms": 1.341,
+      "p95_ms": 1.699,
+      "p99_ms": 3.351,
+      "mean_ms": 1.422
+    }
+  }
+}

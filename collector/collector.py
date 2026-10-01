@@ -293,7 +293,7 @@ def create_app(cfg: Config | None = None, start_background: bool = True) -> Fast
     @app.get("/predictions/latest")
     def predictions_latest():
         return {
-            "predictions": db.latest_predictions(cfg.db_path),
+            "predictions": db.latest_predictions(cfg.db_path, cfg.service_names),
             "last_prediction_at": collector.status["last_prediction_at"],
         }
 
