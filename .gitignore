@@ -1,39 +1,31 @@
-# Virtual environments
-venv/
-*/venv/
-**/venv/
-
 # Python
+.venv/
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
 
-# Databases (local runtime data, not source)
+# Generated dataset (reproducible: python -m model.generate_data --check)
+model/data/
+
+# Runtime databases (SQLite + WAL/SHM files)
 *.db
-collector/metrics.db
+*.db-wal
+*.db-shm
 
-# Node
+# Node / dashboard build
 node_modules/
 dist/
 
 # Logs
 *.log
-collector/collector.log
-api/server*.log
 
-# OS junk
-.DS_Store
-
-# Backup files created during this session
-api/app_before_modelinfo_fix.py
-api/app_v1_backup.py
-api/app_v1_only.py
-README_before_cleanup_backup.md
-
-# Env secrets if any
+# Secrets
 .env
+.env.local
 
-.venv/
-
-# Generated synthetic dataset (reproducible: python -m model.generate_data)
-model/data/
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

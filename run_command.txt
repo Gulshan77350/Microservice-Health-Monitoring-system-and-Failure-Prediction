@@ -1,0 +1,109 @@
+==========================================================================
+ Microservice Health Monitoring & Failure Prediction - how to run
+==========================================================================
+All commands are run from the repository root folder.
+Ports used: 5173 (dashboard), 8001-8003 (services), 8004 (prediction API),
+8005 (collector). Make sure nothing else is using them.
+
+
+--------------------------------------------------------------------------
+ OPTION 1 - Full stack with Docker (recommended)
+--------------------------------------------------------------------------
+Requirements: Docker Desktop running (Compose v2).
+
+  1. (optional) create your env file - defaults work for a local demo:
+       Windows PowerShell:   Copy-Item .env.example .env
+       Linux / macOS:        cp .env.example .env
+
+  2. Build and start everything:
+       docker compose up -d --build
+
+  3. Open:
+       Dashboard            http://localhost:5173
+       Prediction API docs  http://localhost:8004/docs
+       Collector API docs   http://localhost:8005/docs
+       Services             http://localhost:8001/docs  (8002, 8003)
+
+  4. Check status / logs:
+       docker compose ps
+       docker compose logs -f collector
+
+  5. Stop and free all ports:
+       docker compose down            (keeps the SQLite data volumes)
+       docker compose down -v         (also deletes the stored data)
+
+  Demo: click "Simulate failure" on the Order card. Over the next ~30 s (rolling
+  features need ~5 collection cycles) Order rises to MEDIUM/HIGH and Payment,
+  its caller, rises too; Notification stays LOW. Click Reset.
+
+
+--------------------------------------------------------------------------
+ OPTION 2 - Local development without Docker
+--------------------------------------------------------------------------
+Requirements: Python 3.11, Node.js 20+.
+
+  Windows PowerShell - one-time setup:
+       py -3.11 -m venv .venv
+       .\.venv\Scripts\python -m pip install -r requirements-dev.txt
+       cd dashboard; npm ci; cd ..
+
+  Linux / macOS - one-time setup:
+       python3.11 -m venv .venv
+       .venv/bin/python -m pip install -r requirements-dev.txt
+       (cd dashboard && npm ci)        # or: make install dashboard-install
+
+  Start each component in its own terminal (PowerShell shown; on Linux/macOS
+  use `export NAME=value` and .venv/bin/python):
+
+   T1  $env:API_KEY="dev-key"; $env:SERVICE_NAME="payment"; $env:DOWNSTREAM_URL="http://127.0.0.1:8002"
+       .\.venv\Scripts\python -m uvicorn services.app:app --port 8001
+
+   T2  $env:API_KEY="dev-key"; $env:SERVICE_NAME="order"; $env:DOWNSTREAM_URL="http://127.0.0.1:8003"
+       .\.venv\Scripts\python -m uvicorn services.app:app --port 8002
+
+   T3  $env:API_KEY="dev-key"; $env:SERVICE_NAME="notification"; $env:DOWNSTREAM_URL=""
+       .\.venv\Scripts\python -m uvicorn services.app:app --port 8003
+
+   T4  $env:API_KEY="dev-key"; $env:COLLECTOR_URL="http://127.0.0.1:8005"
+       .\.venv\Scripts\python -m uvicorn api.app:app --port 8004
+
+   T5  $env:API_KEY="dev-key"
+       .\.venv\Scripts\python -m uvicorn collector.collector:app --port 8005
+       (defaults point at localhost:8001-8004 and write collector/metrics.db)
+
+   T6  cd dashboard; $env:API_KEY="dev-key"; npm run dev
+       -> http://localhost:5173
+
+  Stop: press Ctrl+C in each terminal.
+
+
+--------------------------------------------------------------------------
+ ML pipeline, tests, quality checks
+--------------------------------------------------------------------------
+  (Windows: .\.venv\Scripts\python   |   Linux/macOS: .venv/bin/python or `make <target>`)
+
+  Generate data (+ verify md5 is identical across two runs):
+       python -m model.generate_data --check            make data
+  Retrain -> artifacts/v3 (+ plots copied to docs/):
+       python -m model.train                            make train
+  Tests:
+       python -m pytest                                 make test
+  Lint / format check:
+       python -m ruff check .   ;   python -m ruff format --check .      make lint
+  Benchmarks -> docs/benchmark.json:
+       python -m scripts.benchmark                      make bench
+  Dashboard lint / build:
+       cd dashboard; npm run lint; npm run build        make dashboard-lint dashboard-build
+
+  After retraining, rebuild the API image so it picks up the new artifact:
+       docker compose up -d --build prediction-api
+
+
+--------------------------------------------------------------------------
+ Free ports manually if something is left running
+--------------------------------------------------------------------------
+  Windows PowerShell:
+       Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -in 5173,8001,8002,8003,8004,8005 } |
+         ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }
+  Linux / macOS:
+       for p in 5173 8001 8002 8003 8004 8005; do lsof -ti tcp:$p | xargs -r kill; done
