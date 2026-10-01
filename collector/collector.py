@@ -1,470 +1,333 @@
 """
-collector.py  —  Tier 2 upgrade
-- Writes metrics to SQLite instead of CSV
-- Exposes a FastAPI server on port 8005 with:
-    GET /history?service=payment&limit=100   → historical data
-    GET /anomalies                           → recent anomaly flags
-    GET /health                              → collector health
-- Anomaly detection: flags any metric > 2 std deviations from
-  its rolling 20-point mean
+Telemetry collector — the only component that writes to SQLite and the ONLY
+caller of the prediction API's /predict/batch.
+
+Every POLL_INTERVAL seconds (one writer thread):
+  1. send PROBES_PER_CYCLE end-to-end probes to payment /process
+     (payment -> order -> notification, one X-Request-ID per probe)
+  2. scrape /metrics from each service and store them (UTC timestamps)
+  3. flag z-score anomalies (|z| > Z_THRESHOLD, default 3) against each
+     metric's previous ROLLING_WIN values
+  4. call /predict/batch once for all services and store the predictions
+  5. every DRIFT_INTERVAL: store a PSI snapshot from the API's /drift and log
+     a `retrain_recommended` event when max PSI crosses 0.25
+  6. maintenance: retention cleanup hourly; VACUUM daily (it rewrites the
+     whole file and blocks the writer for its duration, so it is not run
+     after every cleanup — deleted pages are reused by SQLite anyway)
+
+The read API serves history (metrics joined with predictions), latest
+predictions, anomalies, drift snapshots and events to the dashboard.
 """
 
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-import threading
-import requests
-import sqlite3
-import time
-import statistics
-from datetime import datetime
-from collections import deque
+from __future__ import annotations
+
+import hmac
 import os
+import statistics
+import threading
+import time
+import uuid
+from collections import defaultdict, deque
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
 
-# ── Config ─────────────────────────────────────────────────────────────────
-DB_FILE       = "metrics.db"
-POLL_INTERVAL    = 5      # seconds between scrapes
-ROLLING_WIN      = 20     # window size for anomaly z-score
-RETENTION_DAYS   = 7      # delete rows older than this many days
-CLEANUP_INTERVAL = 3600   # run cleanup every 1 hour (in seconds)
-Z_THRESHOLD   = 2.0        # standard deviations to flag as anomaly
+import requests
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
-SERVICES = [
-    ("payment",      os.getenv("PAYMENT_SERVICE_URL", "http://localhost:8001/metrics")),
-    ("order",        os.getenv("ORDER_SERVICE_URL", "http://localhost:8002/metrics")),
-    ("notification", os.getenv("NOTIFICATION_SERVICE_URL", "http://localhost:8003/metrics")),
-]
+from collector import db
+from common.logging_utils import install_request_logging, request_id_var, setup_logging
 
-METRIC_COLS = ["cpu", "memory", "latency", "requests", "error_rate"]
-
-# ── Rolling windows for anomaly detection (per service per metric) ──────────
-# Structure: windows[service][metric] = deque of last ROLLING_WIN values
-windows: dict[str, dict[str, deque]] = {
-    svc: {col: deque(maxlen=ROLLING_WIN) for col in METRIC_COLS}
-    for svc, _ in SERVICES
-}
-
-# ── SQLite setup ─────────────────────────────────────────────────────────────
-def init_db():
-    con = sqlite3.connect(DB_FILE)
-    cur = con.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS metrics (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp  TEXT    NOT NULL,
-            service    TEXT    NOT NULL,
-            cpu        REAL,
-            memory     REAL,
-            latency    REAL,
-            requests   INTEGER,
-            error_rate REAL
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS anomalies (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp  TEXT NOT NULL,
-            service    TEXT NOT NULL,
-            metric     TEXT NOT NULL,
-            value      REAL,
-            mean       REAL,
-            std        REAL,
-            z_score    REAL
-        )
-    """)
-
-    # Index for fast time-range queries
-    cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_metrics_service_time
-        ON metrics (service, timestamp)
-    """)
-
-    con.commit()
-    con.close()
-    print(f"[DB] Initialised SQLite → {DB_FILE}")
-    cleanup_old_data()  # clean stale data on every startup
+ROOT = Path(__file__).resolve().parents[1]
+log = setup_logging("collector")
 
 
-def insert_metrics(rows: list[dict]):
-    con = sqlite3.connect(DB_FILE)
-    cur = con.cursor()
-    cur.executemany("""
-        INSERT INTO metrics (timestamp, service, cpu, memory, latency, requests, error_rate)
-        VALUES (:timestamp, :service, :cpu, :memory, :latency, :requests, :error_rate)
-    """, rows)
-    con.commit()
-    con.close()
+def _services() -> tuple[tuple[str, str], ...]:
+    return (
+        ("payment", os.getenv("PAYMENT_SERVICE_URL", "http://localhost:8001")),
+        ("order", os.getenv("ORDER_SERVICE_URL", "http://localhost:8002")),
+        ("notification", os.getenv("NOTIFICATION_SERVICE_URL", "http://localhost:8003")),
+    )
 
 
-def insert_anomaly(a: dict):
-    con = sqlite3.connect(DB_FILE)
-    cur = con.cursor()
-    cur.execute("""
-        INSERT INTO anomalies (timestamp, service, metric, value, mean, std, z_score)
-        VALUES (:timestamp, :service, :metric, :value, :mean, :std, :z_score)
-    """, a)
-    con.commit()
-    con.close()
+@dataclass(frozen=True)
+class Config:
+    db_path: str = field(default_factory=lambda: os.getenv("DB_PATH", str(ROOT / "collector" / "metrics.db")))
+    services: tuple[tuple[str, str], ...] = field(default_factory=_services)
+    prediction_api_url: str = field(default_factory=lambda: os.getenv("PREDICTION_API_URL", "http://localhost:8004"))
+    api_key: str = field(default_factory=lambda: os.getenv("API_KEY", ""))
+    probe_url: str = field(default_factory=lambda: os.getenv("PROBE_URL", "http://localhost:8001/process"))
+    probes_per_cycle: int = field(default_factory=lambda: int(os.getenv("PROBES_PER_CYCLE", "3")))
+    poll_interval: float = field(default_factory=lambda: float(os.getenv("POLL_INTERVAL", "5")))
+    retention_days: int = field(default_factory=lambda: int(os.getenv("RETENTION_DAYS", "7")))
+    cleanup_interval: float = field(default_factory=lambda: float(os.getenv("CLEANUP_INTERVAL", "3600")))
+    vacuum_interval: float = field(default_factory=lambda: float(os.getenv("VACUUM_INTERVAL", "86400")))
+    drift_interval: float = field(default_factory=lambda: float(os.getenv("DRIFT_INTERVAL", "300")))
+    rolling_win: int = 20
+    z_threshold: float = field(default_factory=lambda: float(os.getenv("Z_THRESHOLD", "3.0")))
+
+    @property
+    def service_names(self) -> list[str]:
+        return [s for s, _ in self.services]
 
 
-# ── Cleanup old data ─────────────────────────────────────────────────────────
-def cleanup_old_data():
-    """Delete rows older than RETENTION_DAYS. Runs every hour."""
-    con = sqlite3.connect(DB_FILE)
-    cur = con.cursor()
+class AnomalyDetector:
+    """Flags a value whose z-score against the PREVIOUS `window` values exceeds `z_threshold`."""
 
-    cur.execute("""
-        DELETE FROM metrics
-        WHERE timestamp < datetime('now', ? || ' days')
-    """, (f"-{RETENTION_DAYS}",))
-    metrics_deleted = cur.rowcount
+    def __init__(self, window: int, z_threshold: float, min_points: int = 5):
+        self.windows: dict[tuple[str, str], deque] = defaultdict(lambda: deque(maxlen=window))
+        self.z_threshold = z_threshold
+        self.min_points = min_points
 
-    cur.execute("""
-        DELETE FROM anomalies
-        WHERE timestamp < datetime('now', ? || ' days')
-    """, (f"-{RETENTION_DAYS}",))
-    anomalies_deleted = cur.rowcount
-
-    # Reclaim disk space after deletes
-    # cur.execute("VACUUM")
-    con.commit()
-
-    # Get current DB file size in KB
-    db_size_kb = round(os.path.getsize(DB_FILE) / 1024, 1)
-
-    con.close()
-    print(f"[CLEANUP] Deleted {metrics_deleted} metric rows + "
-          f"{anomalies_deleted} anomaly rows older than {RETENTION_DAYS} days")
-    print(f"[CLEANUP] DB size after vacuum: {db_size_kb} KB")
-    return metrics_deleted, anomalies_deleted
-
-
-# ── Cleanup loop (runs in its own thread) ─────────────────────────────────────
-def cleanup_loop():
-    """Runs cleanup_old_data() once per hour."""
-    while True:
-        time.sleep(CLEANUP_INTERVAL)
-        try:
-            cleanup_old_data()
-        except Exception as e:
-            print(f"[CLEANUP ERROR] {e}")
-
-
-# ── Anomaly detection ─────────────────────────────────────────────────────────
-def check_anomalies(service: str, data: dict, ts: str) -> list[dict]:
-    flagged = []
-    for metric in METRIC_COLS:
-        val = data.get(metric)
-        if val is None:
-            continue
-
-        win = windows[service][metric]
-        win.append(val)
-
-        if len(win) < 5:          # need at least 5 points
-            continue
-
-        mean = statistics.mean(win)
-        std  = statistics.stdev(win)
-
-        if std == 0:
-            continue
-
-        z = abs(val - mean) / std
-
-        if z > Z_THRESHOLD:
-            anomaly = {
-                "timestamp": ts,
-                "service":   service,
-                "metric":    metric,
-                "value":     round(val, 3),
-                "mean":      round(mean, 3),
-                "std":       round(std, 3),
-                "z_score":   round(z, 3),
-            }
-            flagged.append(anomaly)
-            insert_anomaly(anomaly)
-            print(f"[ANOMALY] {service}.{metric} = {val:.2f}  "
-                  f"(mean={mean:.2f}, z={z:.2f})")
-    return flagged
-
-
-# ── Collector loop (runs in background thread) ───────────────────────────────
-def collector_loop():
-    init_db()
-    print("[Collector] Started — polling every 5s\n")
-
-    while True:
-        rows = []
-        ts   = datetime.now().isoformat(timespec="seconds")
-
-        for service_name, url in SERVICES:
-            try:
-                resp = requests.get(url, timeout=5)
-                data = resp.json()
-
-                row = {
-                    "timestamp":  ts,
-                    "service":    service_name,
-                    "cpu":        data["cpu"],
-                    "memory":     data["memory"],
-                    "latency":    data["latency"],
-                    "requests":   data["requests"],
-                    "error_rate": data["error_rate"],
-                }
-                rows.append(row)
-
-                check_anomalies(service_name, data, ts)
-
-                print(f"[{ts}] {service_name:<15} "
-                      f"cpu={data['cpu']:.1f}%  "
-                      f"mem={data['memory']:.1f}%  "
-                      f"lat={data['latency']:.0f}ms  "
-                      f"err={data['error_rate']:.1f}%")
-
-            except Exception as e:
-                print(f"[ERROR] {service_name}: {e}")
-
-        if rows:
-            insert_metrics(rows)
-
-            # Autonomous ML prediction & Email Alert trigger via Prediction API
-            pred_url = os.getenv("PREDICTION_API_URL", "http://prediction-api:8004/predict/batch")
-            try:
-                payload = [
-                    {
-                        "service": r["service"],
-                        "metrics": {
-                            "cpu": r["cpu"],
-                            "memory": r["memory"],
-                            "latency": r["latency"],
-                            "requests": r["requests"],
-                            "error_rate": r["error_rate"],
+    def check(self, service: str, data: dict, ts: str) -> list[dict]:
+        flagged = []
+        for metric in db.METRIC_COLS:
+            val = data.get(metric)
+            if val is None:
+                continue
+            win = self.windows[(service, metric)]
+            if len(win) >= self.min_points:
+                mean, std = statistics.mean(win), statistics.stdev(win)
+                if std > 0 and abs(val - mean) / std > self.z_threshold:
+                    flagged.append(
+                        {
+                            "timestamp": ts,
+                            "service": service,
+                            "metric": metric,
+                            "value": round(val, 3),
+                            "mean": round(mean, 3),
+                            "std": round(std, 3),
+                            "z_score": round(abs(val - mean) / std, 3),
                         }
-                    }
-                    for r in rows
-                ]
-                requests.post(pred_url, json=payload, timeout=3)
-            except Exception as e:
-                print(f"[COLLECTOR WARNING] Failed to post metrics to Prediction API ({pred_url}): {e}")
-
-        print("-" * 60)
-        time.sleep(POLL_INTERVAL)
+                    )
+            win.append(val)  # append AFTER scoring so a point is not part of its own baseline
+        return flagged
 
 
-# ── FastAPI server (history + anomaly endpoints) ──────────────────────────────
-app = FastAPI(
-    title="Metrics Collector API",
-    description="Historical metrics and anomaly data from SQLite",
-    version="2.0.0"
-)
+class Collector:
+    def __init__(self, cfg: Config, session: requests.Session | None = None):
+        self.cfg = cfg
+        self.http = session or requests.Session()
+        self.detector = AnomalyDetector(cfg.rolling_win, cfg.z_threshold)
+        self.stop = threading.Event()
+        self.status: dict = {"cycles": 0, "last_cycle_at": None, "last_prediction_at": None, "last_error": None}
+        now = time.monotonic()
+        self._next_cleanup = now
+        self._next_vacuum = now + cfg.vacuum_interval
+        self._next_drift = now + cfg.drift_interval
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    def _api_headers(self) -> dict:
+        return {"X-API-Key": self.cfg.api_key, "X-Request-ID": request_id_var.get()}
 
+    def probe(self) -> None:
+        if not self.cfg.probe_url:
+            return
+        for _ in range(self.cfg.probes_per_cycle):
+            rid = f"probe-{uuid.uuid4().hex[:12]}"
+            try:
+                r = self.http.post(self.cfg.probe_url, headers={"X-Request-ID": rid}, timeout=5)
+                log.debug("probe", extra={"probe_id": rid, "status": r.status_code})
+            except requests.RequestException as exc:
+                log.warning("probe failed", extra={"probe_id": rid, "error": type(exc).__name__})
 
-@app.get("/")
-def home():
-    return {
-        "service": "metrics-collector",
-        "message": "Metrics Collector API is running",
-        "endpoints": {
-            "health": "/health",
-            "history": "/history?service=payment&limit=30",
-            "anomalies": "/anomalies?limit=20",
-            "summary": "/summary",
-            "db_stats": "/db-stats",
-            "docs": "/docs"
-        }
-    }
+    def scrape(self, ts: str) -> list[dict]:
+        rows = []
+        for name, base in self.cfg.services:
+            try:
+                r = self.http.get(f"{base.rstrip('/')}/metrics", timeout=3)
+                r.raise_for_status()
+                data = r.json()
+                rows.append({"timestamp": ts, "service": name, **{k: data[k] for k in db.METRIC_COLS}})
+            except (requests.RequestException, KeyError, ValueError) as exc:
+                log.warning("scrape failed", extra={"target": name, "error": str(exc)})
+        return rows
 
-
-@app.get("/health")
-def health():
-    con = sqlite3.connect(DB_FILE)
-    cur = con.cursor()
-    cur.execute("SELECT COUNT(*) FROM metrics")
-    total = cur.fetchone()[0]
-    con.close()
-    return {
-        "status":       "healthy",
-        "db":           DB_FILE,
-        "total_rows":   total,
-        "poll_interval": POLL_INTERVAL,
-    }
-
-
-@app.get("/history")
-def history(
-    service: str = Query(default=None, description="Filter by service name"),
-    limit:   int = Query(default=100,  ge=1, le=2000, description="Max rows to return"),
-):
-    """
-    Returns historical metrics from SQLite.
-    Used by the dashboard to pre-populate charts on page load.
-
-    Examples:
-        /history                        → last 100 rows all services
-        /history?service=payment        → last 100 rows for payment
-        /history?service=order&limit=50 → last 50 rows for order
-    """
-    con = sqlite3.connect(DB_FILE)
-    cur = con.cursor()
-
-    if service:
-        cur.execute("""
-            SELECT timestamp, service, cpu, memory, latency, requests, error_rate
-            FROM metrics
-            WHERE service = ?
-            ORDER BY timestamp DESC
-            LIMIT ?
-        """, (service, limit))
-    else:
-        cur.execute("""
-            SELECT timestamp, service, cpu, memory, latency, requests, error_rate
-            FROM metrics
-            ORDER BY timestamp DESC
-            LIMIT ?
-        """, (limit,))
-
-    rows = cur.fetchall()
-    con.close()
-
-    cols = ["timestamp", "service", "cpu", "memory", "latency", "requests", "error_rate"]
-    data = [dict(zip(cols, row)) for row in reversed(rows)]  # oldest first
-
-    return {"service": service, "count": len(data), "data": data}
-
-
-@app.get("/anomalies")
-def anomalies(
-    service: str = Query(default=None),
-    limit:   int = Query(default=50, ge=1, le=500),
-):
-    """Returns recent anomaly detections."""
-    con = sqlite3.connect(DB_FILE)
-    cur = con.cursor()
-
-    if service:
-        cur.execute("""
-            SELECT timestamp, service, metric, value, mean, std, z_score
-            FROM anomalies WHERE service = ?
-            ORDER BY timestamp DESC LIMIT ?
-        """, (service, limit))
-    else:
-        cur.execute("""
-            SELECT timestamp, service, metric, value, mean, std, z_score
-            FROM anomalies ORDER BY timestamp DESC LIMIT ?
-        """, (limit,))
-
-    rows = cur.fetchall()
-    con.close()
-
-    cols  = ["timestamp", "service", "metric", "value", "mean", "std", "z_score"]
-    data  = [dict(zip(cols, row)) for row in rows]
-    return {"count": len(data), "anomalies": data}
-
-
-@app.get("/summary")
-def summary():
-    """Per-service averages over the last 100 data points each."""
-    con = sqlite3.connect(DB_FILE)
-    cur = con.cursor()
-    result = {}
-
-    for svc, _ in SERVICES:
-        cur.execute("""
-            SELECT
-                ROUND(AVG(cpu),2)        AS avg_cpu,
-                ROUND(AVG(memory),2)     AS avg_memory,
-                ROUND(AVG(latency),2)    AS avg_latency,
-                ROUND(AVG(error_rate),2) AS avg_error_rate,
-                COUNT(*)                 AS sample_count
-            FROM (
-                SELECT cpu, memory, latency, error_rate
-                FROM metrics WHERE service = ?
-                ORDER BY timestamp DESC LIMIT 100
+    def predict(self, ts: str, rows: list[dict]) -> dict | None:
+        payload = [
+            {"service": r["service"], "timestamp": ts, "metrics": {k: r[k] for k in db.METRIC_COLS}} for r in rows
+        ]
+        try:
+            r = self.http.post(
+                f"{self.cfg.prediction_api_url}/predict/batch", json=payload, headers=self._api_headers(), timeout=5
             )
-        """, (svc,))
-        row = cur.fetchone()
-        result[svc] = {
-            "avg_cpu":        row[0],
-            "avg_memory":     row[1],
-            "avg_latency":    row[2],
-            "avg_error_rate": row[3],
-            "sample_count":   row[4],
+            r.raise_for_status()
+        except requests.RequestException as exc:
+            log.warning("prediction request failed", extra={"error": str(exc)})
+            return None
+        results = r.json()["results"]
+        db.insert_predictions(self.cfg.db_path, ts, results)
+        self.status["last_prediction_at"] = ts
+        return results
+
+    def snapshot_drift(self, ts: str) -> dict | None:
+        try:
+            r = self.http.get(f"{self.cfg.prediction_api_url}/drift", headers=self._api_headers(), timeout=5)
+            r.raise_for_status()
+            report = r.json()
+        except requests.RequestException as exc:
+            log.warning("drift snapshot failed", extra={"error": str(exc)})
+            return None
+        previous = db.last_drift_snapshot(self.cfg.db_path)
+        db.insert_drift_snapshot(self.cfg.db_path, ts, report)
+        if report.get("retrain_recommended") and not (previous and previous["retrain_recommended"]):
+            msg = f"Retrain recommended: max PSI {report.get('max_psi')} > 0.25"
+            db.insert_event(self.cfg.db_path, ts, "warning", "retrain_recommended", msg, report.get("per_feature"))
+            log.warning(msg, extra={"model_version": report.get("model_version")})
+        return report
+
+    def maintenance(self) -> None:
+        now = time.monotonic()
+        if now >= self._next_cleanup:
+            deleted = db.cleanup(self.cfg.db_path, self.cfg.retention_days)
+            log.info("retention cleanup", extra={"deleted": deleted, "retention_days": self.cfg.retention_days})
+            self._next_cleanup = now + self.cfg.cleanup_interval
+        if now >= self._next_vacuum:
+            started = time.perf_counter()
+            db.vacuum(self.cfg.db_path)
+            log.info("vacuum", extra={"duration_ms": round((time.perf_counter() - started) * 1000, 1)})
+            self._next_vacuum = now + self.cfg.vacuum_interval
+
+    def run_cycle(self) -> dict:
+        ts = db.to_ts(db.utc_now())
+        token = request_id_var.set(f"cycle-{uuid.uuid4().hex[:12]}")
+        try:
+            self.probe()
+            rows = self.scrape(ts)
+            results = None
+            if rows:
+                db.insert_metrics(self.cfg.db_path, rows)
+                for row in rows:
+                    for a in self.detector.check(row["service"], row, ts):
+                        db.insert_anomaly(self.cfg.db_path, a)
+                        log.info("anomaly", extra=a)
+                results = self.predict(ts, rows)
+            if time.monotonic() >= self._next_drift:
+                self.snapshot_drift(ts)
+                self._next_drift = time.monotonic() + self.cfg.drift_interval
+            self.status.update(cycles=self.status["cycles"] + 1, last_cycle_at=ts, last_error=None)
+            return {"timestamp": ts, "rows": len(rows), "predictions": results}
+        finally:
+            request_id_var.reset(token)
+
+    def run_forever(self) -> None:
+        log.info("collector loop started", extra={"poll_interval": self.cfg.poll_interval})
+        while not self.stop.is_set():
+            started = time.monotonic()
+            try:
+                self.run_cycle()
+                self.maintenance()
+            except Exception as exc:
+                self.status["last_error"] = str(exc)
+                log.exception("collector cycle failed")
+            self.stop.wait(max(0.0, self.cfg.poll_interval - (time.monotonic() - started)))
+
+
+def create_app(cfg: Config | None = None, start_background: bool = True) -> FastAPI:
+    cfg = cfg or Config()
+    collector = Collector(cfg)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        mode = db.init_db(cfg.db_path)
+        log.info("database ready", extra={"db_path": cfg.db_path, "journal_mode": mode})
+        thread = None
+        if start_background:
+            thread = threading.Thread(target=collector.run_forever, daemon=True, name="collector-loop")
+            thread.start()
+        yield
+        collector.stop.set()
+        if thread:
+            thread.join(timeout=10)
+
+    app = FastAPI(title="Metrics Collector API", version="3.0.0", lifespan=lifespan)
+    app.state.collector = collector
+    install_request_logging(app, log, quiet_paths=frozenset({"/health"}))
+
+    def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
+        if not cfg.api_key:
+            raise HTTPException(503, "API_KEY not configured; mutating endpoints disabled")
+        if not x_api_key or not hmac.compare_digest(x_api_key.encode(), cfg.api_key.encode()):
+            raise HTTPException(401, "Missing or invalid X-API-Key")
+
+    def check_service(service: str | None) -> None:
+        if service is not None and service not in cfg.service_names:
+            raise HTTPException(422, f"Unknown service '{service}'. Allowed: {cfg.service_names}")
+
+    @app.get("/")
+    def home():
+        return {
+            "service": "collector",
+            "endpoints": [
+                "/health",
+                "/history",
+                "/predictions/latest",
+                "/anomalies",
+                "/drift/snapshots",
+                "/events",
+                "/summary",
+                "/db-stats",
+            ],
         }
 
-    con.close()
-    return result
+    @app.get("/health")
+    def health():
+        try:
+            rows = db.stats(cfg.db_path)["row_counts"]["metrics"]
+        except Exception as exc:
+            raise HTTPException(503, f"database unavailable: {exc}") from exc
+        return {
+            "status": "healthy",
+            "total_metric_rows": rows,
+            "poll_interval": cfg.poll_interval,
+            "z_threshold": cfg.z_threshold,
+            **collector.status,
+        }
+
+    @app.get("/history")
+    def history(service: str | None = Query(default=None), limit: int = Query(default=100, ge=1, le=2000)):
+        """Metrics joined with the prediction stored for the same (service, timestamp). Oldest first."""
+        check_service(service)
+        data = db.history(cfg.db_path, service, limit)
+        return {"service": service, "count": len(data), "data": data}
+
+    @app.get("/predictions/latest")
+    def predictions_latest():
+        return {
+            "predictions": db.latest_predictions(cfg.db_path),
+            "last_prediction_at": collector.status["last_prediction_at"],
+        }
+
+    @app.get("/anomalies")
+    def anomalies(service: str | None = Query(default=None), limit: int = Query(default=50, ge=1, le=500)):
+        check_service(service)
+        data = db.anomalies(cfg.db_path, service, limit)
+        return {"count": len(data), "anomalies": data}
+
+    @app.get("/drift/snapshots")
+    def drift_snapshots(limit: int = Query(default=50, ge=1, le=1000)):
+        return {"snapshots": db.drift_snapshots(cfg.db_path, limit)}
+
+    @app.get("/events")
+    def events(limit: int = Query(default=50, ge=1, le=500)):
+        return {"events": db.events(cfg.db_path, limit)}
+
+    @app.get("/summary")
+    def summary():
+        return db.summary(cfg.db_path, cfg.service_names)
+
+    @app.get("/db-stats")
+    def db_stats():
+        return {
+            **db.stats(cfg.db_path),
+            "retention_days": cfg.retention_days,
+            "estimated_metric_rows_per_day": len(cfg.services) * int(86400 / cfg.poll_interval),
+        }
+
+    @app.post("/cleanup", dependencies=[Depends(require_api_key)])
+    def manual_cleanup():
+        return {"deleted": db.cleanup(cfg.db_path, cfg.retention_days), "retention_days": cfg.retention_days}
+
+    return app
 
 
-@app.get("/db-stats")
-def db_stats():
-    """DB size, row counts, oldest/newest entry, retention info."""
-    con = sqlite3.connect(DB_FILE)
-    cur = con.cursor()
-    cur.execute("SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM metrics")
-    m = cur.fetchone()
-    cur.execute("SELECT COUNT(*) FROM anomalies")
-    a = cur.fetchone()
-    cur.execute("SELECT service, COUNT(*) FROM metrics GROUP BY service")
-    per_service = dict(cur.fetchall())
-    con.close()
-
-    db_size_kb = round(os.path.getsize(DB_FILE) / 1024, 1) if os.path.exists(DB_FILE) else 0
-    daily_rows = len(SERVICES) * int(86400 / POLL_INTERVAL)
-
-    return {
-        "db_file":             DB_FILE,
-        "db_size_kb":          db_size_kb,
-        "db_size_mb":          round(db_size_kb / 1024, 3),
-        "total_metric_rows":   m[0],
-        "total_anomaly_rows":  a[0],
-        "oldest_entry":        m[1],
-        "newest_entry":        m[2],
-        "rows_per_service":    per_service,
-        "retention_days":      RETENTION_DAYS,
-        "estimated_daily_rows": daily_rows,
-        "estimated_rows_at_7days": daily_rows * RETENTION_DAYS,
-    }
-
-
-@app.post("/cleanup")
-def manual_cleanup():
-    """Manually trigger data cleanup right now."""
-    deleted_m, deleted_a = cleanup_old_data()
-    db_size_kb = round(os.path.getsize(DB_FILE) / 1024, 1)
-    return {
-        "message":           "Cleanup complete",
-        "deleted_metrics":   deleted_m,
-        "deleted_anomalies": deleted_a,
-        "db_size_kb":        db_size_kb,
-        "retention_days":    RETENTION_DAYS,
-    }
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    # Start collector loop in background thread
-    t = threading.Thread(target=collector_loop, daemon=True)
-    t.start()
-
-    # Start hourly cleanup thread
-    c = threading.Thread(target=cleanup_loop, daemon=True)
-    c.start()
-
-    # Start FastAPI on port 8005
-    print("[API] Starting collector API on http://localhost:8005")
-    uvicorn.run(app, host="0.0.0.0", port=8005)
-
-
-# ── DB Stats ──────────────────────────────────────────────────────────────────
-# (inserted after summary endpoint)
+app = create_app()

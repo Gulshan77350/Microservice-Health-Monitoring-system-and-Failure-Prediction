@@ -84,16 +84,27 @@ services:
 
   # ── Telemetry Collector & Anomaly Detector ───────────────────────────────
   collector:
-    build: ./collector
+    build:
+      context: .
+      dockerfile: collector/Dockerfile
     container_name: collector
     ports:
       - "8005:8005"
     environment:
-      - PAYMENT_SERVICE_URL=http://payment-service:8000/metrics
-      - ORDER_SERVICE_URL=http://order-service:8000/metrics
-      - NOTIFICATION_SERVICE_URL=http://notification-service:8000/metrics
+      - PAYMENT_SERVICE_URL=http://payment-service:8000
+      - ORDER_SERVICE_URL=http://order-service:8000
+      - NOTIFICATION_SERVICE_URL=http://notification-service:8000
+      - PROBE_URL=http://payment-service:8000/process
+      - PREDICTION_API_URL=http://prediction-api:8004
+      - API_KEY=${API_KEY:-local-demo-key}
+      - POLL_INTERVAL=${POLL_INTERVAL:-5}
+      - DRIFT_INTERVAL=${DRIFT_INTERVAL:-300}
+    volumes:
+      - collector-data:/data
     restart: unless-stopped
     depends_on:
+      prediction-api:
+        condition: service_healthy
       payment-service:
         condition: service_healthy
       order-service:
@@ -122,3 +133,4 @@ services:
 
 volumes:
   api-data:
+  collector-data:

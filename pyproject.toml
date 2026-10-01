@@ -11,7 +11,7 @@ addopts = "-q"
 [tool.ruff]
 line-length = 120
 target-version = "py311"
-extend-exclude = ["dashboard", ".venv"]
+extend-exclude = ["dashboard", ".venv", "*.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
