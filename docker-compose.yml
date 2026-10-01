@@ -1,0 +1,116 @@
+version: '3.9'
+
+services:
+
+  # ── Microservice 1: Payment ──────────────────────────────────────────────
+  payment-service:
+    build: ./services/payment
+    container_name: payment-service
+    ports:
+      - "8001:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # ── Microservice 2: Order ────────────────────────────────────────────────
+  order-service:
+    build: ./services/order
+    container_name: order-service
+    ports:
+      - "8002:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # ── Microservice 3: Notification ─────────────────────────────────────────
+  notification-service:
+    build: ./services/notification
+    container_name: notification-service
+    ports:
+      - "8003:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # ── Prediction API (ML model) ─────────────────────────────────────────────
+  prediction-api:
+    build: ./api
+    container_name: prediction-api
+    ports:
+      - "8004:8004"
+    environment:
+      - SMTP_SERVER=${SMTP_SERVER:-smtp.sendgrid.net}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-apikey}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - SENDER_EMAIL=${SENDER_EMAIL:-noreply@example.com}
+      - DEFAULT_RECIPIENT=${DEFAULT_RECIPIENT:-alerts@example.com}
+    restart: unless-stopped
+    depends_on:
+      payment-service:
+        condition: service_healthy
+      order-service:
+        condition: service_healthy
+      notification-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8004/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ── Telemetry Collector & Anomaly Detector ───────────────────────────────
+  collector:
+    build: ./collector
+    container_name: collector
+    ports:
+      - "8005:8005"
+    environment:
+      - PAYMENT_SERVICE_URL=http://payment-service:8000/metrics
+      - ORDER_SERVICE_URL=http://order-service:8000/metrics
+      - NOTIFICATION_SERVICE_URL=http://notification-service:8000/metrics
+    restart: unless-stopped
+    depends_on:
+      payment-service:
+        condition: service_healthy
+      order-service:
+        condition: service_healthy
+      notification-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8005/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── Live React Dashboard ────────────────────────────────────────────────
+  dashboard:
+    build: ./dashboard
+    container_name: dashboard
+    ports:
+      - "5173:80"
+    restart: unless-stopped
+    depends_on:
+      prediction-api:
+        condition: service_healthy
+      collector:
+        condition: service_healthy

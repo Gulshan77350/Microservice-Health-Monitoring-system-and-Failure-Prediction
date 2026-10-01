@@ -1,0 +1,36 @@
+# Virtual environments
+venv/
+*/venv/
+**/venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Databases (local runtime data, not source)
+*.db
+collector/metrics.db
+
+# Node
+node_modules/
+dist/
+
+# Logs
+*.log
+collector/collector.log
+api/server*.log
+
+# OS junk
+.DS_Store
+
+# Backup files created during this session
+api/app_before_modelinfo_fix.py
+api/app_v1_backup.py
+api/app_v1_only.py
+README_before_cleanup_backup.md
+
+# Env secrets if any
+.env
+
+.venv/
