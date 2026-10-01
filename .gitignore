@@ -34,3 +34,6 @@ README_before_cleanup_backup.md
 .env
 
 .venv/
+
+# Generated synthetic dataset (reproducible: python -m model.generate_data)
+model/data/
