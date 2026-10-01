@@ -374,6 +374,13 @@ def main():
     }
     results["rule"]["test"]["note"] = "PR/ROC-AUC use raw error_rate as the ranking score"
 
+    # Trivial reference policies: any useful model must beat these on cost.
+    results["trivial"] = {
+        "always_alert": binary_metrics(y["test"], np.ones_like(y["test"])),
+        "never_alert": binary_metrics(y["test"], np.zeros_like(y["test"])),
+        "test_prevalence": round(float(y["test"].mean()), 4),
+    }
+
     # ── Learned models ──
     folds = timestamp_cv_folds(train_df, n_splits=5, gap=args.horizon)
     print(f"\nTuning XGBoost: {args.n_iter} candidates x {len(folds)} TimeSeriesSplit folds (gap={args.horizon})...")
@@ -416,6 +423,7 @@ def main():
             "test_at_cost_optimal": binary_metrics(y["test"], alerts.astype(int)),
             "test_at_max_f1": binary_metrics(y["test"], (p_test >= thresholds["max_f1"]).astype(int)),
             "early_warning": early_warning(test_df, alerts, args.horizon),
+            "early_warning_at_max_f1": early_warning(test_df, p_test >= thresholds["max_f1"], args.horizon),
         }
     results["xgboost"]["cv_average_precision"] = round(float(search.best_score_), 4)
     results["xgboost"]["best_params"] = {
@@ -540,6 +548,14 @@ def main():
             f"{m['precision']:>7.3f}{m['recall']:>7.3f}{m['f1']:>7.3f}{m['cost']:>8.0f}"
             f"{ew['early_warning_recall'] or 0:>8.3f}{ew['mean_lead_steps'] or 0:>6.2f}"
         )
+    for name in ("always_alert", "never_alert"):
+        m = results["trivial"][name]
+        print(f"{name:<47}{m['precision']:>7.3f}{m['recall']:>7.3f}{m['f1']:>7.3f}{m['cost']:>8.0f}")
+    xm, xe = results["xgboost"]["test_at_max_f1"], results["xgboost"]["early_warning_at_max_f1"]
+    print(
+        f"xgboost @ max-F1: P={xm['precision']:.3f} R={xm['recall']:.3f} F1={xm['f1']:.3f} "
+        f"alert_rate={xm['alert_rate']:.3f} EW-recall={xe['early_warning_recall']}"
+    )
     print(
         f"\nXGBoost thresholds (validation): cost-optimal={thresholds['cost_optimal']}, max-F1={thresholds['max_f1']}"
     )
