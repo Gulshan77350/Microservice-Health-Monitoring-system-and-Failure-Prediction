@@ -122,6 +122,9 @@ services:
   dashboard:
     build: ./dashboard
     container_name: dashboard
+    environment:
+      # Injected server-side by Nginx for the dashboard's few mutating routes.
+      - API_KEY=${API_KEY:-local-demo-key}
     ports:
       - "5173:80"
     restart: unless-stopped
