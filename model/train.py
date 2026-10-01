@@ -532,6 +532,11 @@ def main():
         "metrics": results,
         "per_service_test": per_service,
         "feature_importance": {"gain": gain, "mean_abs_shap": shap_importance},
+        # Golden rows the API re-scores on load (api/model_loader.py) to catch train/serve skew.
+        "serving_check": {
+            "features": X["test"].iloc[::500].to_numpy().tolist(),
+            "expected_probability": test_scores["xgboost"][::500].tolist(),
+        },
     }
     (out_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
 
