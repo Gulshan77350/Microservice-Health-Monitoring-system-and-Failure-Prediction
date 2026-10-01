@@ -1,7 +1,9 @@
-fastapi
-uvicorn
-pandas
-joblib
-xgboost
-scikit-learn
-pydantic
+# Prediction API runtime (Docker, Python 3.11). xgboost-cpu is the CPU-only wheel
+# (same `xgboost` module, without the ~200 MB CUDA/NCCL dependency).
+fastapi==0.142.2
+uvicorn==0.54.0
+pydantic==2.13.5
+email-validator==2.3.0
+numpy==2.4.6
+pandas==3.0.6
+xgboost-cpu==3.2.0

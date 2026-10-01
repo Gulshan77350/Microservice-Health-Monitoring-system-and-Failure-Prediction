@@ -1,435 +1,390 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator, EmailStr
-import pandas as pd
-import joblib
+"""
+Prediction API — serves the calibrated XGBoost failure model from artifacts/v{N}/.
+
+Callers: the collector is the ONLY caller of /predict/batch (every poll cycle).
+The dashboard reads predictions from the collector, and only uses this API for
+model info, feature importance, drift and alert-recipient management.
+
+State (per process — run a single worker; see README "Limitations"):
+  * per-service ring buffer of recent raw metrics for rolling features,
+    seeded from collector history on startup so a restart does not reset
+    the rolling window to a single point;
+  * last timestamp per service, which makes /predict/batch idempotent;
+  * rolling window of live inputs for PSI drift;
+  * per-service alert state for de-duplicating emails.
+"""
+
+from __future__ import annotations
+
+import hmac
 import json
-import os
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from datetime import datetime
+import threading
+import time
+import urllib.parse
+import urllib.request
+from collections import deque
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 
-import drift
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, EmailStr, Field
 
-# ── SMTP / SendGrid Configuration ───────────────────────────────────────────
-SMTP_SERVER   = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER     = os.getenv("SMTP_USER", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-SENDER_EMAIL  = os.getenv("SENDER_EMAIL", "noreply@example.com")
-DEFAULT_RECIPIENT = os.getenv("DEFAULT_RECIPIENT", "alerts@example.com")
+from api.alerts import Mailer, RecipientStore, alert_html, mask_email
+from api.config import Settings
+from api.model_loader import ModelBundle, load_bundle
+from common import drift
+from common.features import BUFFER_SIZE, RAW_FEATURES, WINDOW, FeatureBuffer
+from common.logging_utils import install_request_logging, setup_logging
+from common.risk import classify_risk, root_cause, should_alert
 
-ALERT_RECIPIENTS: list[str] = [DEFAULT_RECIPIENT]
-PREVIOUS_RISK_STATES: dict[str, str] = {}  # Deduplication state per service
+API_VERSION = "3.0.0"
+LIVE_WINDOW = 500
 
-# ── Helper: Send Email via SMTP ──────────────────────────────────────────────
-def send_email_notification(recipients: list[str], subject: str, html_body: str):
-    if not SMTP_USER or not SMTP_PASSWORD:
-        print(f"[SMTP WARNING] Email notification skipped — SMTP_USER or SMTP_PASSWORD not set. Subject: '{subject}'")
-        return False
-
-    if not recipients:
-        print("[SMTP WARNING] No recipients specified for email notification.")
-        return False
-
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = SENDER_EMAIL
-        msg["To"]      = ", ".join(recipients)
-        msg.attach(MIMEText(html_body, "html"))
-
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(SENDER_EMAIL, recipients, msg.as_string())
-
-        print(f"[SMTP SUCCESS] Alert email sent to {recipients} | Subject: '{subject}'")
-        return True
-    except Exception as e:
-        print(f"[SMTP ERROR] Failed to send email: {e}")
-        return False
+log = setup_logging("prediction-api")
 
 
-def build_alert_html(service: str, risk: str, root_cause: str, probability: float, m: dict) -> str:
-    risk_color = "#ef4444" if risk == "HIGH" else "#f59e0b"
-    return f"""
-    <html>
-    <body style="font-family: Arial, sans-serif; background-color: #0f172a; color: #e2e8f0; padding: 20px;">
-      <div style="max-width: 600px; margin: 0 auto; background-color: #1e293b; border-radius: 8px; padding: 24px; border: 1px solid #334155;">
-        <h2 style="color: {risk_color}; margin-top: 0;">⚠️ Microservice Failure Alert — {service.upper()}</h2>
-        <p>Service <strong>{service}</strong> has reached <span style="color: {risk_color}; font-weight: bold;">{risk} RISK</span>.</p>
-        <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
-          <tr style="background-color: #334155;"><th style="padding: 8px; text-align: left;">Metric</th><th style="padding: 8px; text-align: left;">Value</th></tr>
-          <tr><td style="padding: 8px; border-bottom: 1px solid #334155;">Failure Probability</td><td style="padding: 8px; border-bottom: 1px solid #334155;"><strong>{(probability*100):.1f}%</strong></td></tr>
-          <tr><td style="padding: 8px; border-bottom: 1px solid #334155;">Root Cause</td><td style="padding: 8px; border-bottom: 1px solid #334155;">{root_cause}</td></tr>
-          <tr><td style="padding: 8px; border-bottom: 1px solid #334155;">CPU Usage</td><td style="padding: 8px; border-bottom: 1px solid #334155;">{m.get('cpu')}%</td></tr>
-          <tr><td style="padding: 8px; border-bottom: 1px solid #334155;">Memory Usage</td><td style="padding: 8px; border-bottom: 1px solid #334155;">{m.get('memory')}%</td></tr>
-          <tr><td style="padding: 8px; border-bottom: 1px solid #334155;">Latency</td><td style="padding: 8px; border-bottom: 1px solid #334155;">{m.get('latency')} ms</td></tr>
-          <tr><td style="padding: 8px; border-bottom: 1px solid #334155;">Error Rate</td><td style="padding: 8px; border-bottom: 1px solid #334155;">{m.get('error_rate')}%</td></tr>
-        </table>
-        <p style="font-size: 12px; color: #94a3b8;">Automated alert from Microservice Failure Prediction System v3.0</p>
-      </div>
-    </body>
-    </html>
-    """
-
-# ── Load model ───────────────────────────────────────────────────────────────
-model = joblib.load("failure_predictor.pkl")  # swapped to v2 model — see README
-
-FEATURE_NAMES = ["cpu", "memory", "latency", "requests", "error_rate"]
-MODEL_LOADED_AT = datetime.now().isoformat()
-
-# Cost-optimal decision threshold (replaces hardcoded 0.5/0.8 from v1).
-# Selected via train_v2.py to minimize expected cost assuming a missed
-# failure (false negative) costs 10x an unnecessary alert (false positive).
-# Falls back to this literal if model_meta_v2.json isn't present.
-DEFAULT_THRESHOLD = 0.1736
-HIGH_RISK_MULTIPLIER = 2.0  # HIGH risk band = 2x the base decision threshold
-
-
-def _load_threshold() -> float:
-    meta_path = "model_meta_v2.json"
-    if os.path.exists(meta_path):
-        with open(meta_path) as f:
-            meta = json.load(f)
-        return float(meta.get("chosen_threshold", DEFAULT_THRESHOLD))
-    return DEFAULT_THRESHOLD
-
-
-DECISION_THRESHOLD = _load_threshold()
-
-app = FastAPI(
-    title="Microservice Failure Prediction API",
-    description="Predicts microservice failures using XGBoost. Includes batch prediction, feature importance, model metadata, and live drift monitoring.",
-    version="3.0.0"
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.on_event("startup")
-def startup_event():
-    """
-    Load the training data distribution as the drift reference baseline.
-    If the v2 dataset isn't present, drift endpoints report not_initialized
-    instead of crashing the API.
-    """
-    try:
-        drift.load_reference("final_dataset_v2.csv")
-        print("[startup] Drift reference distribution loaded from final_dataset_v2.csv")
-    except FileNotFoundError:
-        print("[startup] WARNING: final_dataset_v2.csv not found — /drift will report not_initialized")
-
-
-# ── Schemas ──────────────────────────────────────────────────────────────────
+# ── Schemas ─────────────────────────────────────────────────────────────────
 class Metrics(BaseModel):
-    cpu:        float = Field(..., ge=0, le=100,   description="CPU usage percent")
-    memory:     float = Field(..., ge=0, le=100,   description="Memory usage percent")
-    latency:    float = Field(..., ge=0,            description="Response latency in ms")
-    requests:   int   = Field(..., ge=0,            description="Number of active requests")
-    error_rate: float = Field(..., ge=0, le=100,   description="Error rate percent")
-
-    @field_validator("cpu", "memory", "error_rate")
-    @classmethod
-    def must_be_percentage(cls, v):
-        if not (0 <= v <= 100):
-            raise ValueError("Must be between 0 and 100")
-        return v
+    cpu: float = Field(..., ge=0, le=100, description="CPU usage percent")
+    memory: float = Field(..., ge=0, le=100, description="Memory usage percent")
+    latency: float = Field(..., ge=0, le=600_000, description="Response latency in ms")
+    requests: int = Field(..., ge=0, description="Request volume proxy")
+    error_rate: float = Field(..., ge=0, le=100, description="Error rate percent")
 
 
 class ServiceMetrics(BaseModel):
-    service: str
+    service: str = Field(..., min_length=1, max_length=64)
     metrics: Metrics
-
-
-class EmailRecipientRequest(BaseModel):
-    email: str
-
-
-class RecipientListRequest(BaseModel):
-    emails: list[str]
-
-
-import numpy as np
-
-RECENT_METRICS_BUFFER: dict[str, list[dict]] = {}
-
-def build_feature_dataframe(metrics_dict: dict, service_name: str = "default") -> pd.DataFrame:
-    buffer = RECENT_METRICS_BUFFER.setdefault(service_name, [])
-    buffer.append(metrics_dict)
-    if len(buffer) > 10:
-        buffer.pop(0)
-    
-    buf_df = pd.DataFrame(buffer)
-    row = metrics_dict.copy()
-    for col in ["cpu", "memory", "latency", "requests", "error_rate"]:
-        vals = buf_df[col].tolist()
-        row[f"{col}_roll5_mean"] = float(np.mean(vals[-5:]))
-        row[f"{col}_roll5_std"] = float(np.std(vals[-5:])) if len(vals) > 1 else 0.0
-        row[f"{col}_diff1"] = float(vals[-1] - vals[-2]) if len(vals) > 1 else 0.0
-
-    row["cpu_x_mem"] = float(row["cpu"] * row["memory"])
-    row["lat_x_err"] = float(row["latency"] * row["error_rate"])
-    row["load_index"] = float((row["requests"] * row["latency"]) / 1000.0)
-    
-    df = pd.DataFrame([row])
-    if hasattr(model, "feature_names_in_"):
-        cols = list(model.feature_names_in_)
-        df = df.reindex(columns=cols, fill_value=0.0)
-    return df
-
-
-# ── Shared prediction logic ───────────────────────────────────────────────────
-def run_prediction(m: Metrics, service_name: str = "unknown", background_tasks: BackgroundTasks = None) -> dict:
-    metrics_dict = {
-        "cpu":        m.cpu,
-        "memory":     m.memory,
-        "latency":    m.latency,
-        "requests":   m.requests,
-        "error_rate": m.error_rate,
-    }
-    data = build_feature_dataframe(metrics_dict, service_name)
-
-    probability = float(model.predict_proba(data)[0][1])
-    prediction = int(probability >= DECISION_THRESHOLD)
-
-    high_cutoff = min(DECISION_THRESHOLD * 1.25, 0.85)
-    if probability >= high_cutoff:
-        risk = "HIGH"
-    elif probability >= DECISION_THRESHOLD:
-        risk = "MEDIUM"
-    else:
-        risk = "LOW"
-
-    root_cause = "Normal Operation"
-    if m.memory > 90:
-        root_cause = "Memory Saturation"
-    elif m.cpu > 90:
-        root_cause = "CPU Overload"
-    elif m.error_rate > 10:
-        root_cause = "Error Spike"
-    elif m.latency > 1000:
-        root_cause = "Latency Surge"
-
-    # Feed live drift monitor
-    drift.record_live_sample({
-        "cpu": m.cpu, "memory": m.memory, "latency": m.latency,
-        "requests": m.requests, "error_rate": m.error_rate,
-    })
-
-    # Trigger background email alert on risk escalation (LOW -> MEDIUM/HIGH or MEDIUM -> HIGH)
-    prev_risk = PREVIOUS_RISK_STATES.get(service_name, "LOW")
-    if risk in ["MEDIUM", "HIGH"] and prev_risk != risk:
-        if background_tasks and ALERT_RECIPIENTS:
-            subject = f"[{risk} ALERT] Service '{service_name}' Failure Risk Warning"
-            html_body = build_alert_html(service_name, risk, root_cause, probability, m.model_dump())
-            background_tasks.add_task(send_email_notification, list(ALERT_RECIPIENTS), subject, html_body)
-    PREVIOUS_RISK_STATES[service_name] = risk
-
-    return {
-        "prediction":          prediction,
-        "failure_probability": round(probability, 4),
-        "risk":                risk,
-        "root_cause":          root_cause,
-        "decision_threshold":  round(DECISION_THRESHOLD, 4),
-    }
-
-
-# ── Endpoints ─────────────────────────────────────────────────────────────────
-
-@app.get("/")
-def home():
-    return {"message": "Microservice Failure Prediction API v3.0 is running"}
-
-
-@app.get("/health")
-def health():
-    return {
-        "status":            "healthy",
-        "model_loaded":      True,
-        "version":           "3.0.0",
-        "loaded_at":         MODEL_LOADED_AT,
-        "decision_threshold": DECISION_THRESHOLD,
-        "smtp_configured":   bool(SMTP_USER and SMTP_PASSWORD),
-        "alert_recipients":  len(ALERT_RECIPIENTS),
-    }
-
-
-# Single prediction
-@app.post("/predict")
-def predict(metrics: Metrics, background_tasks: BackgroundTasks):
-    return run_prediction(metrics, service_name="unknown", background_tasks=background_tasks)
-
-
-# Batch prediction — all services in 1 HTTP call
-@app.post("/predict/batch")
-def predict_batch(services: list[ServiceMetrics], background_tasks: BackgroundTasks):
-    """
-    Accept metrics for multiple services in one request.
-    Reduces 3 round-trips to 1 — used by the dashboard.
-    """
-    if len(services) > 10:
-        raise HTTPException(status_code=400, detail="Max 10 services per batch")
-
-    results = {}
-    for item in services:
-        results[item.service] = run_prediction(item.metrics, service_name=item.service, background_tasks=background_tasks)
-
-    return {"results": results, "count": len(results)}
-
-
-# ── Alert Configuration Endpoints ─────────────────────────────────────────────
-@app.get("/alert-config")
-def get_alert_config():
-    return {
-        "smtp_server":     SMTP_SERVER,
-        "smtp_port":       SMTP_PORT,
-        "smtp_user":       SMTP_USER or "Not configured",
-        "smtp_configured": bool(SMTP_USER and SMTP_PASSWORD),
-        "recipients":      ALERT_RECIPIENTS,
-    }
-
-
-@app.post("/alert-config/add")
-def add_recipient(req: EmailRecipientRequest):
-    email = req.email.strip()
-    if not email:
-        raise HTTPException(status_code=400, detail="Email cannot be empty")
-    if email not in ALERT_RECIPIENTS:
-        ALERT_RECIPIENTS.append(email)
-    return {"message": f"Added {email} to alert recipients", "recipients": ALERT_RECIPIENTS}
-
-
-@app.post("/alert-config/remove")
-def remove_recipient(req: EmailRecipientRequest):
-    email = req.email.strip()
-    if email in ALERT_RECIPIENTS:
-        ALERT_RECIPIENTS.remove(email)
-    return {"message": f"Removed {email} from alert recipients", "recipients": ALERT_RECIPIENTS}
-
-
-@app.post("/alert-config/set")
-def set_recipients(req: RecipientListRequest):
-    global ALERT_RECIPIENTS
-    ALERT_RECIPIENTS = [e.strip() for e in req.emails if e.strip()]
-    return {"message": "Updated alert recipient list", "recipients": ALERT_RECIPIENTS}
-
-
-@app.post("/alert/test")
-def send_test_alert(background_tasks: BackgroundTasks):
-    if not ALERT_RECIPIENTS:
-        raise HTTPException(status_code=400, detail="No alert recipients configured")
-
-    subject = "[TEST ALERT] Microservice Observability System Test Email"
-    html_body = f"""
-    <html>
-      <body style="font-family: Arial, sans-serif; background-color: #0f172a; color: #e2e8f0; padding: 20px;">
-        <div style="max-width: 600px; margin: 0 auto; background-color: #1e293b; border-radius: 8px; padding: 24px; border: 1px solid #334155;">
-          <h2 style="color: #38bdf8; margin-top: 0;">✅ Test Email Delivery Success</h2>
-          <p>This is a test notification from the <strong>Microservice Failure Prediction API</strong>.</p>
-          <p>SMTP host <code>{SMTP_SERVER}:{SMTP_PORT}</code> is correctly wired!</p>
-          <p style="font-size: 12px; color: #94a3b8;">Sent at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
-        </div>
-      </body>
-    </html>
-    """
-
-    background_tasks.add_task(send_email_notification, list(ALERT_RECIPIENTS), subject, html_body)
-    return {
-        "message": "Test email triggered in background task",
-        "recipients": ALERT_RECIPIENTS,
-        "smtp_server": SMTP_SERVER,
-        "smtp_configured": bool(SMTP_USER and SMTP_PASSWORD),
-    }
-
-
-# Feature importance — which metric drives predictions most
-@app.get("/feature-importance")
-def feature_importance():
-    """
-    Returns XGBoost feature importances.
-    Tells you which metric (cpu/memory/latency/etc) matters most for failure prediction.
-    """
-    feature_list = list(model.feature_names_in_) if hasattr(model, "feature_names_in_") else FEATURE_NAMES
-    importances = model.feature_importances_
-    total_imp = float(np.sum(importances)) or 1.0
-    ranked = sorted(
-        [
-            {
-                "feature":    name,
-                "importance": round(float(imp), 6),
-                "importance_pct": round(float(imp) / total_imp * 100, 2),
-            }
-            for name, imp in zip(feature_list, importances)
-        ],
-        key=lambda x: x["importance"],
-        reverse=True,
+    timestamp: datetime | None = Field(
+        default=None, description="Observation time (UTC). Repeated/older timestamps are not re-buffered."
     )
-    return {
-        "feature_importance": ranked,
-        "most_important":     ranked[0]["feature"],
-        "note": "Higher value = stronger driver of failure prediction.",
-    }
 
 
-# Model metadata — algorithm, training info, evaluation metrics
-@app.get("/model-info")
-def model_info():
-    if os.path.exists("model_meta_v2.json"):
-        with open("model_meta_v2.json") as f:
-            meta = json.load(f)
+class EmailIn(BaseModel):
+    email: EmailStr
 
-        comparison = meta.get("model_comparison", {})
-        xgb_tuned = comparison.get("xgboost_tuned", {})
-        xgb_max_f1 = comparison.get("xgboost_max_f1_threshold", {})
-        f1_metrics = xgb_max_f1.get("metrics", {}) or xgb_tuned.get("metrics", {})
 
-        flattened = {
-            "algorithm": "XGBoostClassifier (tuned with feature engineering & optimal threshold)",
-            "accuracy": f1_metrics.get("accuracy"),
-            "f1_score": f1_metrics.get("f1"),
-            "precision": f1_metrics.get("precision"),
-            "recall": f1_metrics.get("recall"),
-            "cv_f1_mean": xgb_tuned.get("cv_f1"),
-            "train_samples": meta.get("train_rows"),
-            "test_samples": meta.get("test_rows"),
+class EmailListIn(BaseModel):
+    emails: list[EmailStr] = Field(..., max_length=50)
+
+
+def _utc(ts: datetime | None) -> datetime | None:
+    if ts is None:
+        return None
+    return ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts.astimezone(UTC)
+
+
+# ── Serving state ───────────────────────────────────────────────────────────
+class ServingState:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.bundle: ModelBundle | None = None
+        self.load_error: str | None = None
+        self.buffers = FeatureBuffer(BUFFER_SIZE)
+        self.last_ts: dict[str, datetime] = {}
+        self.live: dict[str, deque] = {f: deque(maxlen=LIVE_WINDOW) for f in RAW_FEATURES}
+        self.alert_state: dict[str, dict] = {}
+        self.lock = threading.Lock()
+        self.mailer = Mailer(settings)
+        self.store: RecipientStore | None = None
+        self.seed_status: dict = {"status": "not_started"}
+        self.started_at = datetime.now(UTC).isoformat(timespec="seconds")
+
+    def load_model(self) -> None:
+        try:
+            self.bundle = load_bundle(self.settings.artifact_root, self.settings.model_version)
+            self.load_error = None
+            log.info("model loaded", extra={"model_version": self.bundle.version, "path": str(self.bundle.path)})
+        except Exception as exc:
+            self.bundle, self.load_error = None, str(exc)
+            log.exception("model failed to load")
+
+    def open_store(self) -> None:
+        self.store = RecipientStore(self.settings.alert_db_path)
+        if self.settings.default_recipient and not self.store.list():
+            self.store.add(self.settings.default_recipient)
+
+    # Buffer seeding — runs in a background thread so startup never blocks on the collector.
+    def seed_from_collector(self, attempts: int = 12, delay_s: float = 5.0) -> None:
+        url = self.settings.collector_url.rstrip("/")
+        if not url:
+            self.seed_status = {"status": "disabled", "reason": "COLLECTOR_URL not set"}
+            return
+        for attempt in range(1, attempts + 1):
+            try:
+                seeded = {}
+                for svc in self.settings.allowed_services:
+                    query = urllib.parse.urlencode({"service": svc, "limit": BUFFER_SIZE})
+                    with urllib.request.urlopen(f"{url}/history?{query}", timeout=3) as resp:
+                        rows = json.load(resp)["data"]
+                    with self.lock:
+                        if self.buffers.size(svc) == 0 and rows:
+                            seeded[svc] = self.buffers.seed(svc, rows)
+                            self.last_ts[svc] = _utc(datetime.fromisoformat(rows[-1]["timestamp"]))
+                self.seed_status = {"status": "ok", "seeded_rows": seeded, "attempts": attempt}
+                log.info("feature buffers seeded from collector", extra=self.seed_status)
+                return
+            except Exception as exc:
+                self.seed_status = {"status": "retrying", "attempts": attempt, "error": str(exc)}
+                time.sleep(delay_s)
+        self.seed_status["status"] = "failed"
+        log.warning("could not seed feature buffers from collector", extra=self.seed_status)
+
+    def predict(self, item: ServiceMetrics) -> tuple[dict, bool]:
+        bundle = self.bundle
+        svc, raw, ts = item.service, item.metrics.model_dump(), _utc(item.timestamp)
+        with self.lock:
+            last = self.last_ts.get(svc)
+            duplicate = ts is not None and last is not None and ts <= last
+            if duplicate:
+                feats = self.buffers.current(svc)
+            else:
+                feats = self.buffers.push(svc, raw)
+                if ts is not None:
+                    self.last_ts[svc] = ts
+                for f in RAW_FEATURES:
+                    self.live[f].append(raw[f])
+            probability = float(bundle.predict_proba(feats)[0])
+            alert = should_alert(probability, bundle.thresholds)
+            send_email = False
+            if not duplicate:
+                st = self.alert_state.setdefault(svc, {"alerting": False, "last_sent": 0.0})
+                now = time.monotonic()
+                if alert and not st["alerting"] and now - st["last_sent"] >= self.settings.alert_cooldown_s:
+                    send_email, st["last_sent"] = True, now
+                st["alerting"] = alert
+            size = self.buffers.size(svc)
+        result = {
+            "service": svc,
+            "failure_probability": round(probability, 4),
+            "alert": alert,
+            "risk": classify_risk(probability, bundle.risk_bands),
+            "root_cause": root_cause(raw),
+            "model_version": bundle.version,
+            "horizon_steps": bundle.metadata["target"]["horizon_steps"],
+            "thresholds": bundle.thresholds,
+            "buffer_size": size,
+            "buffer_warm": size >= WINDOW,
+            "duplicate": duplicate,
+        }
+        return result, send_email
+
+
+# ── App factory ─────────────────────────────────────────────────────────────
+def create_app(settings: Settings | None = None, seed_on_startup: bool = True) -> FastAPI:
+    settings = settings or Settings()
+    state = ServingState(settings)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        state.load_model()
+        state.open_store()
+        if seed_on_startup:
+            threading.Thread(target=state.seed_from_collector, daemon=True, name="seed-buffers").start()
+        log.info(
+            "startup complete",
+            extra={"alerts_enabled": state.mailer.enabled, "auth_configured": bool(settings.api_key)},
+        )
+        yield
+
+    app = FastAPI(
+        title="Microservice Failure Prediction API",
+        description="Calibrated XGBoost failure-risk model with PSI drift monitoring and email alerts.",
+        version=API_VERSION,
+        lifespan=lifespan,
+    )
+    app.state.serving = state
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
+        allow_headers=["Content-Type", "X-API-Key", "X-Request-ID"],
+    )
+    install_request_logging(app, log, quiet_paths=frozenset({"/health"}))
+
+    def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
+        if not settings.api_key:
+            raise HTTPException(503, "API_KEY is not configured on the server; mutating endpoints are disabled")
+        if not x_api_key or not hmac.compare_digest(x_api_key.encode(), settings.api_key.encode()):
+            raise HTTPException(401, "Missing or invalid X-API-Key")
+
+    def require_model() -> ModelBundle:
+        if state.bundle is None:
+            raise HTTPException(503, f"Model not loaded: {state.load_error}")
+        return state.bundle
+
+    def require_store() -> RecipientStore:
+        if state.store is None:
+            raise HTTPException(503, "Recipient store not initialised")
+        return state.store
+
+    def check_service(name: str) -> None:
+        if name not in settings.allowed_services:
+            raise HTTPException(422, f"Unknown service '{name}'. Allowed: {settings.allowed_services}")
+
+    def queue_alert_email(bg: BackgroundTasks, item: ServiceMetrics, result: dict) -> None:
+        recipients = state.store.emails() if state.store else []
+        if not (state.mailer.enabled and recipients):
+            return
+        subject = f"[{result['risk']}] Failure risk for '{item.service}'"
+        bg.add_task(state.mailer.send, recipients, subject, alert_html(item.service, result, item.metrics.model_dump()))
+
+    @app.exception_handler(Exception)
+    async def unhandled(request: Request, exc: Exception):
+        log.exception("unhandled error", extra={"path": request.url.path})
+        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
+    # ── Read-only endpoints ──
+    @app.get("/")
+    def home():
+        return {"service": "prediction-api", "version": API_VERSION, "docs": "/docs"}
+
+    @app.get("/health")
+    def health():
+        body = {
+            "status": "healthy" if state.bundle else "unhealthy",
+            "api_version": API_VERSION,
+            "model_loaded": state.bundle is not None,
+            "model_version": state.bundle.version if state.bundle else None,
+            "model_error": state.load_error,
+            "started_at": state.started_at,
+            "alerts_enabled": state.mailer.enabled,
+            "alerts_disabled_reason": None
+            if state.mailer.enabled
+            else "SMTP_SERVER/SMTP_USER/SMTP_PASSWORD/SENDER_EMAIL not all set",
+            "alert_recipients": len(state.store.list()) if state.store else 0,
+            "auth_configured": bool(settings.api_key),
+            "feature_buffers": state.buffers.sizes(),
+            "buffer_seed": state.seed_status,
+        }
+        return JSONResponse(status_code=200 if state.bundle else 503, content=body)
+
+    @app.get("/model-info")
+    def model_info(bundle: ModelBundle = Depends(require_model)):
+        meta = bundle.metadata
+        xgb = meta["metrics"]["xgboost"]
+        return {
+            "model_version": bundle.version,
+            "algorithm": meta["algorithm"],
+            "created_at_utc": meta["created_at_utc"],
+            "git_sha": meta["git"]["sha"],
+            "dataset_md5": meta["dataset"]["md5"],
+            "target": meta["target"],
+            "thresholds": meta["thresholds"],
+            "risk_bands": meta["risk_bands"],
+            "calibration": meta["calibration"]["method"],
+            "test_metrics": {
+                **xgb["test"],
+                "at_cost_optimal": xgb["test_at_cost_optimal"],
+                "at_max_f1": xgb["test_at_max_f1"],
+                "early_warning": xgb["early_warning"],
+            },
+            "baselines": {
+                name: {
+                    **meta["metrics"][name]["test"],
+                    "at_cost_optimal": meta["metrics"][name]["test_at_cost_optimal"],
+                }
+                for name in ("rule", "logistic_regression", "random_forest")
+            },
+            "trivial": meta["metrics"]["trivial"],
+            "split": meta["split"],
+            "per_service_test": meta["per_service_test"],
+            "libraries": meta["libraries"],
         }
 
-        return {**flattened, **meta}
+    @app.get("/feature-importance")
+    def feature_importance(bundle: ModelBundle = Depends(require_model)):
+        imp = bundle.metadata["feature_importance"]
+        method = "mean_abs_shap" if imp.get("mean_abs_shap") else "gain"
+        values = imp[method]
+        total = sum(values.values()) or 1.0
+        ranked = sorted(
+            (
+                {"feature": k, "importance": round(v, 6), "importance_pct": round(100 * v / total, 2)}
+                for k, v in values.items()
+            ),
+            key=lambda r: -r["importance"],
+        )
+        return {"method": method, "model_version": bundle.version, "feature_importance": ranked}
 
-    if os.path.exists("model_meta.json"):
-        with open("model_meta.json") as f:
-            return json.load(f)
+    @app.get("/drift")
+    def drift_report(bundle: ModelBundle = Depends(require_model)):
+        with state.lock:
+            live = {f: list(v) for f, v in state.live.items()}
+        return {
+            **drift.drift_report(bundle.drift_reference, live),
+            "window_size": LIVE_WINDOW,
+            "model_version": bundle.version,
+        }
 
-    return {
-        "algorithm":        "XGBoostClassifier",
-        "note":             "model_meta_v2.json not found — run model/train_v2.py to generate it",
-        "features":         FEATURE_NAMES,
-        "trained_at":       "unknown",
-    }
+    @app.get("/alert-config")
+    def get_alert_config(store: RecipientStore = Depends(require_store)):
+        return {
+            "alerts_enabled": state.mailer.enabled,
+            "smtp_server": settings.smtp_server or None,
+            "cooldown_seconds": settings.alert_cooldown_s,
+            "recipients": [{"id": r["id"], "email": mask_email(r["email"])} for r in store.list()],
+        }
+
+    # ── Mutating endpoints (X-API-Key required) ──
+    @app.post("/predict", dependencies=[Depends(require_api_key)])
+    def predict(item: ServiceMetrics, bg: BackgroundTasks, bundle: ModelBundle = Depends(require_model)):
+        check_service(item.service)
+        result, send = state.predict(item)
+        if send:
+            queue_alert_email(bg, item, result)
+        return result
+
+    @app.post("/predict/batch", dependencies=[Depends(require_api_key)])
+    def predict_batch(items: list[ServiceMetrics], bg: BackgroundTasks, bundle: ModelBundle = Depends(require_model)):
+        if not items:
+            raise HTTPException(422, "Batch is empty")
+        if len(items) > settings.max_batch:
+            raise HTTPException(413, f"Batch too large: {len(items)} > {settings.max_batch}")
+        names = [i.service for i in items]
+        if len(set(names)) != len(names):
+            raise HTTPException(422, "Each service may appear at most once per batch")
+        for name in names:
+            check_service(name)
+        results = {}
+        for item in items:
+            result, send = state.predict(item)
+            if send:
+                queue_alert_email(bg, item, result)
+            results[item.service] = result
+        return {"results": results, "count": len(results), "model_version": bundle.version}
+
+    @app.post("/alert-config/recipients", status_code=201, dependencies=[Depends(require_api_key)])
+    def add_recipient(body: EmailIn, store: RecipientStore = Depends(require_store)):
+        row = store.add(body.email)
+        return {"id": row["id"], "email": mask_email(row["email"])}
+
+    @app.delete("/alert-config/recipients/{recipient_id}", dependencies=[Depends(require_api_key)])
+    def remove_recipient(recipient_id: int, store: RecipientStore = Depends(require_store)):
+        if not store.remove(recipient_id):
+            raise HTTPException(404, "Recipient not found")
+        return {"removed": recipient_id}
+
+    @app.put("/alert-config/recipients", dependencies=[Depends(require_api_key)])
+    def replace_recipients(body: EmailListIn, store: RecipientStore = Depends(require_store)):
+        store.replace([str(e) for e in body.emails])
+        return {"recipients": [{"id": r["id"], "email": mask_email(r["email"])} for r in store.list()]}
+
+    @app.post("/alert/test", dependencies=[Depends(require_api_key)])
+    def send_test_alert(bg: BackgroundTasks, store: RecipientStore = Depends(require_store)):
+        if not state.mailer.enabled:
+            raise HTTPException(409, "Alerts are disabled: SMTP is not configured")
+        recipients = store.emails()
+        if not recipients:
+            raise HTTPException(409, "No alert recipients configured")
+        body = "<p>Test notification from the Microservice Failure Prediction API.</p>"
+        bg.add_task(state.mailer.send, recipients, "[TEST] Failure prediction alert channel", body)
+        return {"queued": True, "recipient_count": len(recipients)}
+
+    return app
 
 
-# Drift monitoring — compares live request distributions to training baseline
-@app.get("/drift")
-def drift_report():
-    """
-    Population Stability Index (PSI) drift report.
-
-    Compares the rolling window of recent live /predict inputs against the
-    training data distribution. PSI < 0.1 = stable, 0.1-0.25 = moderate
-    shift worth investigating, > 0.25 = significant shift, model likely
-    needs retraining.
-
-    This closes the loop on the project's premise: it's not enough to
-    predict failure once at training time, you also need to know when the
-    model itself has stopped applying to current conditions.
-    """
-    return drift.compute_drift_report()
+app = create_app()

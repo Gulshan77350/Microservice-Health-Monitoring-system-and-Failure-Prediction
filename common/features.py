@@ -90,6 +90,10 @@ class FeatureBuffer:
             buf.append({k: float(r[k]) for k in RAW_FEATURES})
         return len(buf)
 
+    def current(self, service: str) -> pd.DataFrame:
+        """Features for the latest buffered observation, without adding a new one."""
+        return features_for_latest(self._buffers.get(service, ()))
+
     def size(self, service: str) -> int:
         return len(self._buffers.get(service, ()))
 

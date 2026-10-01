@@ -1,5 +1,7 @@
-pandas
-numpy
-scikit-learn
-xgboost
-joblib
+# Training pipeline (python -m model.generate_data && python -m model.train)
+numpy==2.4.6
+pandas==3.0.6
+scikit-learn==1.9.1
+xgboost==3.2.0
+matplotlib==3.11.2
+shap==0.51.0

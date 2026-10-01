@@ -49,17 +49,24 @@ services:
 
   # ── Prediction API (ML model) ─────────────────────────────────────────────
   prediction-api:
-    build: ./api
+    build:
+      context: .
+      dockerfile: api/Dockerfile
     container_name: prediction-api
     ports:
       - "8004:8004"
     environment:
-      - SMTP_SERVER=${SMTP_SERVER:-smtp.sendgrid.net}
+      - API_KEY=${API_KEY:-local-demo-key}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:5173}
+      - COLLECTOR_URL=http://collector:8005
+      - SMTP_SERVER=${SMTP_SERVER:-}
       - SMTP_PORT=${SMTP_PORT:-587}
-      - SMTP_USER=${SMTP_USER:-apikey}
-      - SMTP_PASSWORD=${SMTP_PASSWORD}
-      - SENDER_EMAIL=${SENDER_EMAIL:-noreply@example.com}
-      - DEFAULT_RECIPIENT=${DEFAULT_RECIPIENT:-alerts@example.com}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - SENDER_EMAIL=${SENDER_EMAIL:-}
+      - DEFAULT_RECIPIENT=${DEFAULT_RECIPIENT:-}
+    volumes:
+      - api-data:/data
     restart: unless-stopped
     depends_on:
       payment-service:
@@ -114,3 +121,6 @@ services:
         condition: service_healthy
       collector:
         condition: service_healthy
+
+volumes:
+  api-data:

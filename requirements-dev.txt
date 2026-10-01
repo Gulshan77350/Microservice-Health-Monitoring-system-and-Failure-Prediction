@@ -1,0 +1,11 @@
+# Everything needed to train, test and lint locally (Python 3.11).
+-r model/requirements.txt
+fastapi==0.142.2
+uvicorn==0.54.0
+pydantic==2.13.5
+email-validator==2.3.0
+psutil==7.2.2
+requests==2.34.2
+httpx==0.28.1
+pytest==9.1.1
+ruff==0.16.10
