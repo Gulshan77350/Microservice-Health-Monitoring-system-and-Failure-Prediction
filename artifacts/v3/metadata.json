@@ -1,13 +1,13 @@
 {
   "model_version": "v3",
   "algorithm": "XGBoostClassifier + sigmoid calibration (CalibratedClassifierCV on validation)",
-  "created_at_utc": "2026-10-01T21:50:50+00:00",
+  "created_at_utc": "2026-10-01T22:12:05+00:00",
   "git": {
-    "sha": "68687ac8ca0a69f35631621632317bbf6845b9e7",
-    "training_code_dirty": true
+    "sha": "247a7fe7cf914dca9fea75e1814dd71b07c86a1f",
+    "training_code_dirty": false
   },
   "dataset": {
-    "path": "model\\data\\synthetic_telemetry.csv",
+    "path": "model/data/synthetic_telemetry.csv",
     "md5": "f3efbf80f92bf3d8e22113029bda2e08",
     "rows": 14400,
     "per_step_failure_rate": 0.1755,
